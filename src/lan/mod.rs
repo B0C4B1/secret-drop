@@ -23,7 +23,7 @@ pub use crypto::is_valid_key;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -39,11 +39,12 @@ use crypto::{
     chunk_nonce, derive_key, generate_key, hash_file, hex_encode, match_id, normalize_key,
     proof_for, random_bytes, salt_for, token_for,
 };
-use discovery::{broadcast_targets, handle_packet};
+use discovery::{broadcast_targets, handle_packet, parse_reply};
 use fsname::{part_path, sanitize_file_name, unique_path};
 use server::{ConnGuard, handle_conn, http_error_text, send_abort, send_done};
 
-const BROADCAST_PORT: u16 = 7778;
+/// 默认发现端口；同机多实例或端口被占用时可在界面上改成别的值（两端需一致）
+pub const DEFAULT_DISCOVERY_PORT: u16 = 7778;
 const PROTO_VERSION: &str = "1";
 /// 一次性密钥的存活时间，过期后自动从分享列表移除
 const SHARE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -58,6 +59,7 @@ const CHUNK_WIRE: u64 = CHUNK_SIZE + CHUNK_OVERHEAD;
 /// 发送列表里展示的一条分享
 pub struct ShareItem {
     pub key: String,
+    /// 展示用名称：非 UTF-8 文件名已做有损转换
     pub file_name: String,
     pub file_size: u64,
     pub used: bool,
@@ -68,9 +70,10 @@ pub struct ShareItem {
 /// 接收方解析到的发送方
 pub struct ResolvedPeer {
     pub key: String,
-    pub ip: Ipv4Addr,
+    pub ip: IpAddr,
     pub port: u16,
-    pub file_name: String,
+    /// 原始文件名字节，Unix 上可能不是 UTF-8
+    pub file_name: Vec<u8>,
     pub file_size: u64,
     pub token: String,
     file_hash: [u8; 32],
@@ -85,7 +88,8 @@ enum ShareState {
 
 struct ShareRecord {
     path: PathBuf,
-    file_name: String,
+    /// 原始文件名字节，直接按字节发给对端
+    file_name: Vec<u8>,
     file_size: u64,
     modified: Option<SystemTime>,
     master_key: [u8; 32],
@@ -105,7 +109,7 @@ impl ShareRecord {
         }
         let raw_name = path
             .file_name()
-            .map(|s| s.to_string_lossy().to_string())
+            .map(platform::os_name_to_bytes)
             .ok_or_else(|| "文件名不合法".to_string())?;
         let file_name = sanitize_file_name(&raw_name).ok_or_else(|| "文件名不合法".to_string())?;
         let file_hash = hash_file(&path)?;
@@ -167,7 +171,7 @@ impl ShareRecord {
         let elapsed = self.created.elapsed().as_secs();
         ShareItem {
             key: self.key.clone(),
-            file_name: self.file_name.clone(),
+            file_name: String::from_utf8_lossy(&self.file_name).into_owned(),
             file_size: self.file_size,
             used: self.state == ShareState::Used,
             remaining_secs: self.ttl().as_secs().saturating_sub(elapsed),
@@ -178,10 +182,10 @@ impl ShareRecord {
 /// 收到但尚未校验的发现应答
 #[derive(Clone)]
 struct PendingPeer {
-    ip: Ipv4Addr,
+    ip: IpAddr,
     port: u16,
     nonce_hex: String,
-    file_name: String,
+    file_name: Vec<u8>,
     file_size: u64,
     file_hash: [u8; 32],
     proof_hex: String,
@@ -190,6 +194,7 @@ struct PendingPeer {
 /// 局域网协作：负责发现、HTTP 传输与分享记录
 pub struct Collab {
     port: u16,
+    discovery_port: u16,
     running: Arc<AtomicBool>,
     shares: Arc<Mutex<HashMap<String, ShareRecord>>>,
     resolved: Arc<Mutex<HashMap<String, PendingPeer>>>,
@@ -197,21 +202,23 @@ pub struct Collab {
     waiting: Arc<Mutex<HashSet<String>>>,
     udp: Mutex<Option<Arc<UdpSocket>>>,
     discovery_thread: Mutex<Option<JoinHandle<()>>>,
-    http_thread: Mutex<Option<JoinHandle<()>>>,
+    /// HTTP 监听线程：IPv4 一个，IPv6 可用时再加一个（双栈系统上只有一个）
+    http_threads: Mutex<Vec<JoinHandle<()>>>,
     conns: Arc<AtomicUsize>,
 }
 
 impl Collab {
-    pub fn new(port: u16) -> Self {
+    pub fn new(port: u16, discovery_port: u16) -> Self {
         Self {
             port,
+            discovery_port,
             running: Arc::new(AtomicBool::new(false)),
             shares: Arc::new(Mutex::new(HashMap::new())),
             resolved: Arc::new(Mutex::new(HashMap::new())),
             waiting: Arc::new(Mutex::new(HashSet::new())),
             udp: Mutex::new(None),
             discovery_thread: Mutex::new(None),
-            http_thread: Mutex::new(None),
+            http_threads: Mutex::new(Vec::new()),
             conns: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -224,13 +231,20 @@ impl Collab {
         self.port
     }
 
+    pub fn discovery_port(&self) -> u16 {
+        self.discovery_port
+    }
+
     /// 启动发现服务（只绑定 UDP）。接收方无需占用 TCP 端口。
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
         if self.is_running() {
             return Ok(());
         }
-        let udp = UdpSocket::bind(("0.0.0.0", BROADCAST_PORT)).map_err(|e| {
-            format!("无法绑定发现端口 {BROADCAST_PORT}：{e}（同一台电脑上只能运行一个实例）")
+        let udp = UdpSocket::bind(("0.0.0.0", self.discovery_port)).map_err(|e| {
+            format!(
+                "无法绑定发现端口 {}：{e}（可能已被占用，可改成其它端口；同一台电脑上只能运行一个实例）",
+                self.discovery_port
+            )
         })?;
         udp.set_broadcast(true).map_err(|e| e.to_string())?;
         udp.set_read_timeout(Some(Duration::from_millis(150)))
@@ -257,54 +271,44 @@ impl Collab {
     }
 
     /// 按需绑定 TCP 端口（只有发送方需要）
+    ///
+    /// 先尝试绑定 `[::]`：Linux/macOS 默认是双栈，一个 socket 同时服务 IPv4 与 IPv6；
+    /// Windows 默认只服务 IPv6，所以还要再绑 `0.0.0.0`。IPv6 不可用时只保留 IPv4。
     fn ensure_http(self: &Arc<Self>) -> Result<(), String> {
-        let mut guard = lock(&self.http_thread);
-        if guard.is_some() {
+        let mut threads = lock(&self.http_threads);
+        if !threads.is_empty() {
             return Ok(());
         }
-        let listener = TcpListener::bind(("0.0.0.0", self.port)).map_err(|e| {
-            let hint = platform::bind_hint(self.port);
-            format!("无法监听端口 {}：{e}{hint}", self.port)
-        })?;
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-
-        let me = self.clone();
-        let handle = std::thread::spawn(move || {
-            while me.running.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        if me.conns.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
-                            let _ = stream.shutdown(Shutdown::Both);
-                            continue;
-                        }
-                        me.conns.fetch_add(1, Ordering::Relaxed);
-                        let me2 = me.clone();
-                        std::thread::spawn(move || {
-                            let _guard = ConnGuard(me2.conns.clone());
-                            let _ = stream.set_nodelay(true);
-                            handle_conn(stream, &me2);
-                        });
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
+        let mut dual_stack = false;
+        if let Ok(listener6) = TcpListener::bind(("::", self.port))
+            && listener6.set_nonblocking(true).is_ok()
+        {
+            threads.push(spawn_acceptor(listener6, self.clone()));
+            dual_stack = true;
+        }
+        match TcpListener::bind(("0.0.0.0", self.port)) {
+            Ok(listener) => {
+                listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+                threads.push(spawn_acceptor(listener, self.clone()));
             }
-        });
-        *guard = Some(handle);
+            // 双栈 socket 已覆盖 IPv4，重复绑定会报占用，属于正常情况
+            Err(e) if dual_stack && e.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(e) => {
+                let hint = platform::bind_hint(self.port);
+                return Err(format!("无法监听端口 {}：{e}{hint}", self.port));
+            }
+        }
         Ok(())
     }
 
     /// 停止发现与 HTTP 服务
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
-        for handle in [
-            lock(&self.discovery_thread).take(),
-            lock(&self.http_thread).take(),
-        ]
-        .into_iter()
-        .flatten()
+        let http = std::mem::take(&mut *lock(&self.http_threads));
+        for handle in [lock(&self.discovery_thread).take()]
+            .into_iter()
+            .flatten()
+            .chain(http)
         {
             let _ = handle.join();
         }
@@ -413,7 +417,7 @@ impl Collab {
     pub fn resolve_at(
         &self,
         key: &str,
-        ip: Ipv4Addr,
+        ip: IpAddr,
         cancel: &AtomicBool,
         timeout: Duration,
     ) -> Result<ResolvedPeer, String> {
@@ -425,8 +429,14 @@ impl Collab {
         key: &str,
         cancel: &AtomicBool,
         timeout: Duration,
-        direct: Option<Ipv4Addr>,
+        direct: Option<IpAddr>,
     ) -> Result<ResolvedPeer, String> {
+        // 主发现 socket 只绑定 IPv4，IPv6 直连需要单独开 socket
+        if let Some(ip) = direct
+            && ip.is_ipv6()
+        {
+            return self.resolve_v6(key, ip, cancel, timeout);
+        }
         let key = normalize_key(key)
             .ok_or_else(|| "密钥格式不正确（应为 8 位字母或数字）".to_string())?;
         let salt = salt_for(&key);
@@ -439,10 +449,10 @@ impl Collab {
             .clone()
             .ok_or_else(|| "发现服务未启动".to_string())?;
         let targets: Vec<SocketAddr> = match direct {
-            Some(ip) => vec![SocketAddr::new(IpAddr::V4(ip), BROADCAST_PORT)],
+            Some(ip) => vec![SocketAddr::new(ip, self.discovery_port)],
             None => broadcast_targets()
                 .into_iter()
-                .map(|t| SocketAddr::new(IpAddr::V4(t), BROADCAST_PORT))
+                .map(|t| SocketAddr::new(IpAddr::V4(t), self.discovery_port))
                 .collect(),
         };
 
@@ -472,7 +482,7 @@ impl Collab {
                 if ok {
                     lock(&self.waiting).remove(&mid_hex);
                     let file_name = sanitize_file_name(&p.file_name)
-                        .unwrap_or_else(|| "download.bin".to_string());
+                        .unwrap_or_else(|| b"download.bin".to_vec());
                     return Ok(ResolvedPeer {
                         key,
                         ip: p.ip,
@@ -493,13 +503,99 @@ impl Collab {
         lock(&self.waiting).remove(&mid_hex);
         match direct {
             Some(ip) => Err(format!(
-                "无法连接 {ip}:{BROADCAST_PORT}（请确认 IP 正确、发送方仍在等待，且对方防火墙允许 UDP {BROADCAST_PORT}）"
+                "无法连接 {ip}:{}（请确认 IP 正确、发送方仍在等待，且对方防火墙允许 UDP {}）",
+                self.discovery_port, self.discovery_port
             )),
             None => {
                 let hint = platform::discovery_hint();
                 Err(format!(
                     "未找到持有该密钥的设备（请确认在同一局域网，且发送方仍显示待接收）{hint}"
                 ))
+            }
+        }
+    }
+
+    /// 直连 IPv6 发送方：主发现 socket 只绑定 IPv4，这里临时开一个 IPv6 socket
+    /// 完成查询与应答（应答回到临时端口，因此在本函数内同步收取）。
+    ///
+    /// 纯 IPv6 局域网无法靠 IPv4 广播发现，用户需手动填写对方地址；
+    /// proof 校验与 IPv4 流程完全一致。
+    fn resolve_v6(
+        &self,
+        key: &str,
+        ip: IpAddr,
+        cancel: &AtomicBool,
+        timeout: Duration,
+    ) -> Result<ResolvedPeer, String> {
+        let key = normalize_key(key)
+            .ok_or_else(|| "密钥格式不正确（应为 8 位字母或数字）".to_string())?;
+        let master = derive_key(&key, &salt_for(&key))?;
+        let mid_hex = hex_encode(&match_id(&master));
+        let nonce: [u8; 16] = random_bytes()?;
+        let nonce_hex = hex_encode(&nonce);
+        let query = format!("Q\t{PROTO_VERSION}\t{mid_hex}\t{nonce_hex}");
+        let addr = SocketAddr::new(ip, self.discovery_port);
+        let sock = UdpSocket::bind(("::", 0)).map_err(|e| format!("无法创建 IPv6 连接：{e}"))?;
+        sock.set_read_timeout(Some(Duration::from_millis(150)))
+            .map_err(|e| e.to_string())?;
+
+        let fail = || {
+            format!(
+                "无法连接 [{ip}]:{}（请确认地址正确、发送方仍在等待，且对方防火墙允许 UDP {}）",
+                self.discovery_port, self.discovery_port
+            )
+        };
+        let deadline = Instant::now() + timeout;
+        let mut next_send = Instant::now();
+        let mut buf = [0u8; 2048];
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("已取消".to_string());
+            }
+            if Instant::now() >= next_send {
+                // 链路本地地址需要写清 zone id，否则发送会失败，这里直接给出提示
+                sock.send_to(query.as_bytes(), addr)
+                    .map_err(|e| format!("{}{e}", fail()))?;
+                next_send = Instant::now() + Duration::from_millis(300);
+            }
+            match sock.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    let Some(text) = std::str::from_utf8(&buf[..n]).ok() else {
+                        continue;
+                    };
+                    let parts: Vec<&str> = text.split('\t').collect();
+                    if parts.first() != Some(&"R") {
+                        continue;
+                    }
+                    let Some(reply) = parse_reply(&parts) else {
+                        continue;
+                    };
+                    let expect = hex_encode(&proof_for(&master, &nonce));
+                    if reply.nonce_hex != nonce_hex
+                        || hex_encode(&reply.mid) != mid_hex
+                        || reply.proof_hex != expect
+                    {
+                        continue;
+                    }
+                    let file_name = sanitize_file_name(&reply.file_name)
+                        .unwrap_or_else(|| b"download.bin".to_vec());
+                    return Ok(ResolvedPeer {
+                        key,
+                        ip,
+                        port: reply.port,
+                        file_name,
+                        file_size: reply.file_size,
+                        token: token_for(&master),
+                        file_hash: reply.file_hash,
+                    });
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(format!("{}{e}", fail())),
+            }
+            if Instant::now() >= deadline {
+                return Err(fail());
             }
         }
     }
@@ -512,6 +608,26 @@ impl Collab {
             .find_map(|iface| match iface.addr {
                 if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() && !v4.ip.is_link_local() => {
                     Some(v4.ip)
+                }
+                _ => None,
+            })
+    }
+
+    /// 本机的全局/ULA IPv6 地址，供对方手动直连时填写。
+    ///
+    /// 链路本地地址（fe80::）发送时必须带 zone id，而 `if-addrs` 不提供接口索引，
+    /// 因此这里只展示不需要 zone id 的地址。
+    pub fn local_ipv6() -> Option<Ipv6Addr> {
+        if_addrs::get_if_addrs()
+            .ok()?
+            .into_iter()
+            .find_map(|iface| match iface.addr {
+                if_addrs::IfAddr::V6(v6)
+                    if !v6.ip.is_loopback()
+                        && !v6.ip.is_unspecified()
+                        && !v6.ip.is_unicast_link_local() =>
+                {
+                    Some(v6.ip)
                 }
                 _ => None,
             })
@@ -594,7 +710,12 @@ impl Collab {
         }
 
         let wire_offset = part_len / CHUNK_SIZE * CHUNK_WIRE;
-        let url = format!("http://{}:{}/get/{}", peer.ip, peer.port, peer.token);
+        let url = format!(
+            "http://{}:{}/get/{}",
+            url_host(peer.ip),
+            peer.port,
+            peer.token
+        );
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(120))
@@ -677,8 +798,43 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 在已就绪的监听器上接受连接，直到服务停止
+fn spawn_acceptor(listener: TcpListener, me: Arc<Collab>) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        while me.running.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if me.conns.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                    me.conns.fetch_add(1, Ordering::Relaxed);
+                    let me2 = me.clone();
+                    std::thread::spawn(move || {
+                        let _guard = ConnGuard(me2.conns.clone());
+                        let _ = stream.set_nodelay(true);
+                        handle_conn(stream, &me2);
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
 fn prune(shares: &mut HashMap<String, ShareRecord>) {
     shares.retain(|_, r| !r.expired());
+}
+
+/// URL 中的主机部分：IPv6 地址必须用方括号包起来
+pub(super) fn url_host(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
 }
 
 #[cfg(test)]
@@ -700,24 +856,44 @@ mod tests {
     }
 
     #[test]
+    fn url_host_brackets_ipv6() {
+        assert_eq!(url_host("192.168.1.2".parse().unwrap()), "192.168.1.2");
+        // URL 里的 IPv6 必须加方括号，否则 ureq 会把地址解析错
+        assert_eq!(url_host("fe80::1".parse().unwrap()), "[fe80::1]");
+    }
+
+    #[test]
     fn sanitize_rejects_traversal() {
-        assert_eq!(sanitize_file_name("../../etc/passwd").unwrap(), "passwd");
-        assert_eq!(sanitize_file_name("C:\\tmp\\a.txt").unwrap(), "a.txt");
-        assert!(sanitize_file_name("..").is_none());
-        assert!(sanitize_file_name("   ").is_none());
+        assert_eq!(sanitize_file_name(b"../../etc/passwd").unwrap(), b"passwd");
+        assert_eq!(sanitize_file_name(b"C:\\tmp\\a.txt").unwrap(), b"a.txt");
+        assert!(sanitize_file_name(b"..").is_none());
+        assert!(sanitize_file_name(b"   ").is_none());
     }
 
     #[test]
     fn sanitize_strips_trailing_dots() {
-        assert_eq!(sanitize_file_name("report.txt. ").unwrap(), "report.txt");
+        assert_eq!(sanitize_file_name(b"report.txt. ").unwrap(), b"report.txt");
+    }
+
+    #[test]
+    fn sanitize_keeps_non_utf8_bytes() {
+        let raw = [b'a', 0xff, b'.', b't', b'x', b't'];
+        let out = sanitize_file_name(&raw).unwrap();
+        assert_eq!(out, raw);
+        // 截断也不能把非 UTF-8 字节弄丢
+        let long = [vec![0xffu8; 400], b".txt".to_vec()].concat();
+        let out = sanitize_file_name(&long).unwrap();
+        assert!(out.len() <= 200);
+        assert!(out.ends_with(b".txt"));
+        assert!(out[..out.len() - 4].iter().all(|&b| b == 0xff));
     }
 
     #[test]
     fn sanitize_limits_length() {
         let long = format!("{}.txt", "a".repeat(400));
-        let out = sanitize_file_name(&long).unwrap();
+        let out = sanitize_file_name(long.as_bytes()).unwrap();
         assert!(out.len() <= 200);
-        assert!(out.ends_with(".txt"));
+        assert!(out.ends_with(b".txt"));
     }
 
     #[test]
@@ -808,7 +984,7 @@ mod tests {
         std::fs::write(&src, &data).unwrap();
 
         let port = free_port();
-        let collab = Arc::new(Collab::new(port));
+        let collab = Arc::new(Collab::new(port, DEFAULT_DISCOVERY_PORT));
         collab.running.store(true, Ordering::Relaxed);
         collab.ensure_http().unwrap();
         let key = collab.share_file(src).unwrap();

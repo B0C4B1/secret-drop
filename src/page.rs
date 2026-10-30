@@ -1,6 +1,6 @@
 //! 密钥快传界面：发送方生成一次性密钥，接收方输入密钥接收文件。
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +14,8 @@ use crate::theme;
 
 pub struct TransferPage {
     port: String,
+    /// UDP 发现端口，两端必须一致；7778 被占用时可改
+    discovery_port: String,
     collab: Option<Arc<Collab>>,
     download_dir: Option<PathBuf>,
 
@@ -43,6 +45,7 @@ impl Default for TransferPage {
     fn default() -> Self {
         Self {
             port: "8765".to_string(),
+            discovery_port: crate::lan::DEFAULT_DISCOVERY_PORT.to_string(),
             collab: None,
             download_dir: None,
             key_input: String::new(),
@@ -70,13 +73,15 @@ impl TransferPage {
         ui.horizontal(|ui| {
             ui.label(RichText::new("端口：").color(theme::TEXT_SECONDARY));
             ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(70.0));
-            ui.label(
-                RichText::new("发送或接收时自动开启，空闲时自动关闭")
-                    .size(11.0)
-                    .color(theme::TEXT_MUTED),
-            );
+            ui.add_space(10.0);
+            ui.label(RichText::new("发现端口：").color(theme::TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.discovery_port).desired_width(70.0));
         });
-
+        ui.label(
+            RichText::new("发送/接收时自动开启，空闲时关闭；两台设备的发现端口必须相同")
+                .size(11.0)
+                .color(theme::TEXT_MUTED),
+        );
         ui.label(RichText::new("下载目录：").color(theme::TEXT_SECONDARY));
         dir_picker(ui, &mut self.download_dir);
 
@@ -153,11 +158,19 @@ impl TransferPage {
         }
     }
 
+    fn parse_discovery_port(&self) -> Result<u16, String> {
+        match self.discovery_port.trim().parse() {
+            Ok(p) if p > 0 => Ok(p),
+            _ => Err("发现端口无效".to_string()),
+        }
+    }
+
     /// 按需启动：首次使用时创建，未运行则启动端口
     fn ensure_started(&mut self) -> Result<Arc<Collab>, String> {
         let port = self.parse_port()?;
+        let discovery_port = self.parse_discovery_port()?;
         if let Some(c) = &self.collab {
-            if c.port() == port {
+            if c.port() == port && c.discovery_port() == discovery_port {
                 if !c.is_running() {
                     c.clone().start()?;
                 }
@@ -171,7 +184,7 @@ impl TransferPage {
                 return Err("端口正在使用中，请等待当前传输结束后再修改".to_string());
             }
         }
-        let c = Arc::new(Collab::new(port));
+        let c = Arc::new(Collab::new(port, discovery_port));
         self.collab = Some(c.clone());
         c.start()?;
         Ok(c)
@@ -265,10 +278,11 @@ impl TransferPage {
         }
         let direct = match self.peer_ip.trim() {
             "" => None,
-            raw => match raw.parse::<Ipv4Addr>() {
+            raw => match raw.trim_matches(['[', ']']).parse::<IpAddr>() {
                 Ok(ip) => Some(ip),
                 Err(_) => {
-                    self.status = "发送方 IP 格式不正确，应形如 192.168.1.23".to_string();
+                    self.status =
+                        "发送方 IP 格式不正确，应形如 192.168.1.23 或 fe80::1".to_string();
                     return;
                 }
             },
@@ -383,6 +397,13 @@ impl TransferPage {
                     .color(theme::TEXT_MUTED),
             );
         }
+        if let Some(ip) = Collab::local_ipv6() {
+            ui.label(
+                RichText::new(format!("本机 IPv6：{ip}"))
+                    .size(11.0)
+                    .color(theme::TEXT_MUTED),
+            );
+        }
 
         let mut regen: Option<String> = None;
         let mut remove: Option<String> = None;
@@ -473,8 +494,8 @@ impl TransferPage {
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.peer_ip)
-                        .hint_text("留空自动搜索，例如 192.168.1.23")
-                        .desired_width(200.0),
+                        .hint_text("留空自动搜索，例如 192.168.1.23 或 fe80::1")
+                        .desired_width(240.0),
                 );
                 ui.label(
                     RichText::new("填上方发送方的局域网地址")

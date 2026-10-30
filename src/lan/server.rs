@@ -279,7 +279,12 @@ pub(super) fn send_abort(peer: &ResolvedPeer) {
 }
 
 pub(super) fn post_peer(peer: &ResolvedPeer, action: &str) -> Result<(), String> {
-    let url = format!("http://{}:{}/{action}/{}", peer.ip, peer.port, peer.token);
+    let url = format!(
+        "http://{}:{}/{action}/{}",
+        super::url_host(peer.ip),
+        peer.port,
+        peer.token
+    );
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(Duration::from_secs(5))

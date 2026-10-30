@@ -1,6 +1,6 @@
 //! UDP 发现协议：查询/应答报文的编解码与广播地址推导。
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 
 use super::crypto::{hex_decode, hex_decode_arr, hex_encode, proof_for};
@@ -46,7 +46,7 @@ pub(super) fn handle_query(parts: &[&str], src: SocketAddr, udp: &UdpSocket, me:
                     "R\t{PROTO_VERSION}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     parts[2],
                     parts[3],
-                    hex_encode(r.file_name.as_bytes()),
+                    hex_encode(&r.file_name),
                     r.file_size,
                     me.port,
                     hex_encode(&r.file_hash),
@@ -59,42 +59,52 @@ pub(super) fn handle_query(parts: &[&str], src: SocketAddr, udp: &UdpSocket, me:
     }
 }
 
+/// 解析后的应答，尚未做 proof 校验
+pub(super) struct Reply {
+    pub mid: [u8; 8],
+    pub nonce_hex: String,
+    pub file_name: Vec<u8>,
+    pub file_size: u64,
+    pub port: u16,
+    pub file_hash: [u8; 32],
+    pub proof_hex: String,
+}
+
 /// 应答：`R\tv1\t{match}\t{nonce}\t{name_hex}\t{size}\t{port}\t{hash_hex}\t{proof_hex}`
-pub(super) fn handle_reply(parts: &[&str], src: SocketAddr, me: &Arc<Collab>) {
+pub(super) fn parse_reply(parts: &[&str]) -> Option<Reply> {
     if parts.len() < 9 || parts[1] != PROTO_VERSION {
-        return;
+        return None;
     }
-    let Some(mid) = hex_decode_arr::<8>(parts[2]) else {
-        return;
-    };
+    let mid = hex_decode_arr::<8>(parts[2])?;
     let nonce_hex = parts[3];
     if nonce_hex.len() != 32 {
-        return;
+        return None;
     }
-    let Some(name_bytes) = hex_decode(parts[4]) else {
-        return;
-    };
-    let Ok(file_name) = String::from_utf8(name_bytes) else {
-        return;
-    };
-    let Ok(file_size) = parts[5].parse::<u64>() else {
-        return;
-    };
-    let Ok(port) = parts[6].parse::<u16>() else {
-        return;
-    };
-    let Some(file_hash) = hex_decode_arr::<32>(parts[7]) else {
-        return;
-    };
+    // 文件名按原始字节接收，非 UTF-8 名字也原样保留
+    let file_name = hex_decode(parts[4])?;
+    let file_size = parts[5].parse::<u64>().ok()?;
+    let port = parts[6].parse::<u16>().ok()?;
+    let file_hash = hex_decode_arr::<32>(parts[7])?;
     let proof_hex = parts[8];
     if proof_hex.len() != 64 {
-        return;
+        return None;
     }
-    let IpAddr::V4(ip) = src.ip() else {
+    Some(Reply {
+        mid,
+        nonce_hex: nonce_hex.to_string(),
+        file_name,
+        file_size,
+        port,
+        file_hash,
+        proof_hex: proof_hex.to_string(),
+    })
+}
+
+pub(super) fn handle_reply(parts: &[&str], src: SocketAddr, me: &Arc<Collab>) {
+    let Some(reply) = parse_reply(parts) else {
         return;
     };
-
-    let mid_hex = hex_encode(&mid);
+    let mid_hex = hex_encode(&reply.mid);
     // 只接受当前正在解析的 match，避免被无关或伪造的应答污染
     if !lock(&me.waiting).contains(&mid_hex) {
         return;
@@ -102,13 +112,13 @@ pub(super) fn handle_reply(parts: &[&str], src: SocketAddr, me: &Arc<Collab>) {
     lock(&me.resolved).insert(
         mid_hex,
         PendingPeer {
-            ip,
-            port,
-            nonce_hex: nonce_hex.to_string(),
-            file_name,
-            file_size,
-            file_hash,
-            proof_hex: proof_hex.to_string(),
+            ip: src.ip(),
+            port: reply.port,
+            nonce_hex: reply.nonce_hex,
+            file_name: reply.file_name,
+            file_size: reply.file_size,
+            file_hash: reply.file_hash,
+            proof_hex: reply.proof_hex,
         },
     );
 }

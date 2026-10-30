@@ -4,26 +4,53 @@
 //! 这样在 macOS/Linux 上也能执行 Windows 分支的单元测试——兼容性改动不必换机器才能验证。
 //! 例外：`windows_subsystem` 是 crate 级属性，只能写在 main.rs。
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// 当前系统是否为 Windows
 pub(crate) const WINDOWS: bool = cfg!(windows);
 
-/// 把 Windows 不允许出现在文件名里的字符替换为下划线
-pub(crate) fn replace_illegal_chars(name: &str, windows: bool) -> String {
-    if !windows {
-        return name.to_string();
+/// 本地文件名 → 可通过协议传输的原始字节（Unix 上文件名可以不是 UTF-8）
+pub(crate) fn os_name_to_bytes(name: &OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        name.as_bytes().to_vec()
     }
-    name.chars()
-        .map(|c| match c {
-            '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+    #[cfg(not(unix))]
+    {
+        name.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+/// 协议传来的原始字节 → 当前平台的 `OsString`；Windows 只接受合法 UTF-8
+pub(crate) fn os_name_from_bytes(bytes: &[u8]) -> Option<OsString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes.to_vec()).ok().map(OsString::from)
+    }
+}
+
+/// 把 Windows 不允许出现在文件名里的字符替换为下划线
+pub(crate) fn replace_illegal_chars(name: &[u8], windows: bool) -> Vec<u8> {
+    if !windows {
+        return name.to_vec();
+    }
+    name.iter()
+        .map(|&b| match b {
+            b'<' | b'>' | b':' | b'"' | b'|' | b'?' | b'*' => b'_',
             other => other,
         })
         .collect()
 }
 
 /// Windows 保留设备名（不区分大小写，且与扩展名无关）
-pub(crate) fn is_reserved_name(name: &str, windows: bool) -> bool {
+pub(crate) fn is_reserved_name(name: &[u8], windows: bool) -> bool {
     if !windows {
         return false;
     }
@@ -31,8 +58,17 @@ pub(crate) fn is_reserved_name(name: &str, windows: bool) -> bool {
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
         "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
-    let stem = name.split('.').next().unwrap_or(name).trim_end();
-    RESERVED.contains(&stem.to_ascii_uppercase().as_str())
+    let end = name.iter().position(|&b| b == b'.').unwrap_or(name.len());
+    let mut stem = &name[..end];
+    while let [rest @ .., last] = stem {
+        if !last.is_ascii_whitespace() {
+            break;
+        }
+        stem = rest;
+    }
+    RESERVED
+        .iter()
+        .any(|r| r.as_bytes().eq_ignore_ascii_case(stem))
 }
 
 /// 目录下文件名的字节预算：Windows 受 MAX_PATH(260) 限制，其它平台不限制（返回 `None`）
@@ -122,16 +158,32 @@ mod tests {
 
     #[test]
     fn illegal_chars_only_rewritten_on_windows() {
-        assert_eq!(replace_illegal_chars("a<b>c:d", true), "a_b_c_d");
-        assert_eq!(replace_illegal_chars("a<b>c:d", false), "a<b>c:d");
+        assert_eq!(replace_illegal_chars(b"a<b>c:d", true), b"a_b_c_d");
+        assert_eq!(replace_illegal_chars(b"a<b>c:d", false), b"a<b>c:d");
     }
 
     #[test]
     fn reserved_names_only_on_windows() {
-        assert!(is_reserved_name("CON", true));
-        assert!(is_reserved_name("con.txt", true));
-        assert!(!is_reserved_name("console", true));
-        assert!(!is_reserved_name("CON", false));
+        assert!(is_reserved_name(b"CON", true));
+        assert!(is_reserved_name(b"con.txt", true));
+        assert!(!is_reserved_name(b"console", true));
+        assert!(!is_reserved_name(b"CON", false));
+    }
+
+    #[test]
+    fn os_name_bytes_roundtrip_preserves_utf8() {
+        let raw = "中文 名字.txt".as_bytes();
+        let os = os_name_from_bytes(raw).expect("合法 UTF-8 应能转成文件名");
+        assert_eq!(os_name_to_bytes(&os), raw);
+    }
+
+    /// Unix 上文件名可以不是 UTF-8，非 UTF-8 字节必须原样保留
+    #[cfg(unix)]
+    #[test]
+    fn os_name_bytes_roundtrip_preserves_non_utf8() {
+        let raw = [0x66, 0x6f, 0xff, 0x6f];
+        let os = os_name_from_bytes(&raw).expect("字节应能原样转成文件名");
+        assert_eq!(os_name_to_bytes(&os), raw);
     }
 
     #[test]
