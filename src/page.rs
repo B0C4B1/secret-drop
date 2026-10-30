@@ -1,5 +1,7 @@
 //! 密钥快传界面：发送方生成一次性密钥，接收方输入密钥接收文件。
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,7 +53,7 @@ impl Default for TransferPage {
             key_input: String::new(),
             peer_ip: String::new(),
             file_path_input: String::new(),
-            received: Vec::new(),
+            received: load_history(),
             status: String::new(),
             progress_written: 0,
             progress_total: 0,
@@ -117,6 +119,7 @@ impl TransferPage {
                     }
                     Ok(RecvMsg::Done(p)) => {
                         self.received.push(p.display().to_string());
+                        append_history(&p.display().to_string());
                         self.status = "接收完成".to_string();
                         self.key_input.clear();
                         self.receiving = false;
@@ -201,13 +204,26 @@ impl TransferPage {
     }
 
     fn pick_and_share(&mut self) {
-        let Some(file) = rfd::FileDialog::new().pick_file() else {
+        match rfd::FileDialog::new().pick_files() {
+            Some(files) if !files.is_empty() => {
+                self.share_paths(files);
+            }
             // 没有 xdg-desktop-portal 的精简 Linux 桌面上会直接返回 None，
             // 与“用户取消”无法区分，所以只给指引，不当作错误
-            self.status = "未选择文件；若没有弹出对话框，请展开下方“手动输入文件路径”".to_string();
-            return;
-        };
-        self.share_selected(file);
+            _ => {
+                self.status =
+                    "未选择文件；若没有弹出对话框，请展开下方“手动输入文件路径”".to_string()
+            }
+        }
+    }
+
+    fn pick_folder_and_share(&mut self) {
+        match rfd::FileDialog::new().pick_folder() {
+            Some(dir) => {
+                self.share_paths(vec![dir]);
+            }
+            None => self.status = "未选择文件夹".to_string(),
+        }
     }
 
     fn share_path(&mut self) {
@@ -221,12 +237,23 @@ impl TransferPage {
             self.status = format!("路径不存在或不是文件：{}", file.display());
             return;
         }
-        if self.share_selected(file) {
-            self.file_path_input.clear();
+        let collab = match self.ensure_started() {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        match collab.share_file(file) {
+            Ok(key) => {
+                self.status = format!("已生成密钥：{key}（请告知对方）");
+                self.file_path_input.clear();
+            }
+            Err(e) => self.status = e,
         }
     }
 
-    fn share_selected(&mut self, file: PathBuf) -> bool {
+    fn share_paths(&mut self, paths: Vec<PathBuf>) -> bool {
         let collab = match self.ensure_started() {
             Ok(c) => c,
             Err(e) => {
@@ -234,7 +261,7 @@ impl TransferPage {
                 return false;
             }
         };
-        match collab.share_file(file) {
+        match collab.share_paths(paths) {
             Ok(key) => {
                 self.status = format!("已生成密钥：{key}（请告知对方）");
                 true
@@ -341,6 +368,7 @@ impl TransferPage {
 
     fn clear_history(&mut self) {
         self.received.clear();
+        clear_history_log();
     }
 
     fn share_ui(&mut self, ui: &mut egui::Ui) {
@@ -351,12 +379,20 @@ impl TransferPage {
                 .strong()
                 .color(theme::TEXT),
         );
-        if ui
-            .add_enabled(!self.receiving, primary_button("选择文件并生成密钥"))
-            .clicked()
-        {
-            self.pick_and_share();
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.receiving, primary_button("选择文件（可多选）"))
+                .clicked()
+            {
+                self.pick_and_share();
+            }
+            if ui
+                .add_enabled(!self.receiving, primary_button("发送文件夹（打包）"))
+                .clicked()
+            {
+                self.pick_folder_and_share();
+            }
+        });
 
         // 精简 Linux 桌面可能没有文件对话框后端，留一条手动输入的退路
         egui::CollapsingHeader::new(
@@ -549,8 +585,26 @@ impl TransferPage {
                 .auto_shrink([false, false])
                 .max_height(120.0)
                 .show(ui, |ui| {
+                    let mut open_file: Option<PathBuf> = None;
+                    let mut open_dir: Option<PathBuf> = None;
                     for p in &self.received {
-                        ui.label(RichText::new(p).size(11.0).color(theme::TEXT));
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(p).size(11.0).color(theme::TEXT));
+                            if ui.small_button("打开").clicked() {
+                                open_file = Some(PathBuf::from(p));
+                            }
+                            if ui.small_button("文件夹").clicked() {
+                                if let Some(dir) = PathBuf::from(p).parent() {
+                                    open_dir = Some(dir.to_path_buf());
+                                }
+                            }
+                        });
+                    }
+                    if let Some(p) = open_file {
+                        let _ = open::that(&p);
+                    }
+                    if let Some(d) = open_dir {
+                        let _ = open::that(&d);
                     }
                 });
         }
@@ -558,6 +612,47 @@ impl TransferPage {
 }
 
 // ---------- 辅助函数（从原工程抽取的最小集合） ----------
+
+/// 接收历史日志路径：本地文件，不上传任何服务器或数据库
+fn history_log_path() -> Option<PathBuf> {
+    let base = dirs::data_local_dir().or_else(dirs::home_dir)?;
+    Some(base.join("secret-drop").join("history.log"))
+}
+
+/// 启动时读取本地日志，恢复接收历史
+fn load_history() -> Vec<String> {
+    let Some(path) = history_log_path() else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(&path)
+        .map(|s| {
+            s.lines()
+                .map(str::to_string)
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 每次接收完成追加一行到本地日志
+fn append_history(entry: &str) {
+    let Some(path) = history_log_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{entry}");
+    }
+}
+
+/// 清理历史：同时删除本地日志文件
+fn clear_history_log() {
+    if let Some(path) = history_log_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];

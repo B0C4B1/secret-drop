@@ -13,9 +13,11 @@
 //! - [`server`]：发送方 HTTP 服务（`/get`、`/done`、`/abort`）；
 //! - [`fsname`]：文件名清洗与跨平台路径处理。
 
+mod archive;
 mod crypto;
 mod discovery;
 mod fsname;
+mod mdns;
 mod server;
 
 pub use crypto::is_valid_key;
@@ -35,12 +37,18 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 
 use crate::platform;
 
+use archive::zip_paths;
 use crypto::{
     chunk_nonce, derive_key, generate_key, hash_file, hex_encode, match_id, normalize_key,
     proof_for, random_bytes, salt_for, token_for,
 };
 use discovery::{broadcast_targets, handle_packet, parse_reply};
 use fsname::{part_path, sanitize_file_name, unique_path};
+use mdns::{
+    find as mdns_find, new_daemon as mdns_new_daemon, register as mdns_register,
+    unregister as mdns_unregister,
+};
+use mdns_sd::ServiceDaemon;
 use server::{ConnGuard, handle_conn, http_error_text, send_abort, send_done};
 
 /// 默认发现端口；同机多实例或端口被占用时可在界面上改成别的值（两端需一致）
@@ -99,6 +107,8 @@ struct ShareRecord {
     key: String,
     state: ShareState,
     created: Instant,
+    /// 打包产生的临时 zip，分享结束后需要删除
+    temp: bool,
 }
 
 impl ShareRecord {
@@ -125,6 +135,7 @@ impl ShareRecord {
             key: String::new(),
             state: ShareState::Pending,
             created: Instant::now(),
+            temp: false,
         };
         rec.rekey()?;
         Ok(rec)
@@ -205,6 +216,10 @@ pub struct Collab {
     /// HTTP 监听线程：IPv4 一个，IPv6 可用时再加一个（双栈系统上只有一个）
     http_threads: Mutex<Vec<JoinHandle<()>>>,
     conns: Arc<AtomicUsize>,
+    /// mDNS 守护进程（启动失败时降级为仅 UDP 广播）
+    mdns: Mutex<Option<ServiceDaemon>>,
+    /// match_id_hex -> 已注册的 mDNS 服务全名
+    mdns_services: Mutex<HashMap<String, String>>,
 }
 
 impl Collab {
@@ -220,6 +235,8 @@ impl Collab {
             discovery_thread: Mutex::new(None),
             http_threads: Mutex::new(Vec::new()),
             conns: Arc::new(AtomicUsize::new(0)),
+            mdns: Mutex::new(None),
+            mdns_services: Mutex::new(HashMap::new()),
         }
     }
 
@@ -267,6 +284,13 @@ impl Collab {
             }
         });
         *lock(&self.discovery_thread) = Some(handle);
+
+        // 初始化 mDNS（失败静默降级，UDP 广播仍可用）
+        if lock(&self.mdns).is_none() {
+            if let Ok(daemon) = mdns_new_daemon() {
+                *lock(&self.mdns) = Some(daemon);
+            }
+        }
         Ok(())
     }
 
@@ -313,6 +337,10 @@ impl Collab {
             let _ = handle.join();
         }
         *lock(&self.udp) = None;
+        if let Some(daemon) = lock(&self.mdns).take() {
+            let _ = daemon.shutdown();
+        }
+        lock(&self.mdns_services).clear();
     }
 
     pub fn maybe_auto_stop(&self) {
@@ -337,12 +365,64 @@ impl Collab {
     }
 
     pub fn remove_share(&self, key: &str) {
-        lock(&self.shares).remove(key);
+        let rec = lock(&self.shares).remove(key);
+        if let Some(rec) = rec {
+            self.unregister_mdns(rec.match_id);
+            if rec.temp {
+                let _ = std::fs::remove_file(rec.path);
+            }
+        }
+    }
+
+    /// 注册 mDNS 服务（best-effort，失败不阻断 UDP 发现）
+    fn register_mdns(&self, mid: [u8; 8]) {
+        let Some(daemon) = lock(&self.mdns).clone() else {
+            return;
+        };
+        let Some(ip) = Self::local_ipv4() else {
+            return;
+        };
+        let mid_hex = hex_encode(&mid);
+        if let Ok(fullname) = mdns_register(&daemon, &mid_hex, ip, self.discovery_port) {
+            lock(&self.mdns_services).insert(mid_hex, fullname);
+        }
+    }
+
+    /// 注销 mDNS 服务
+    fn unregister_mdns(&self, mid: [u8; 8]) {
+        let Some(daemon) = lock(&self.mdns).clone() else {
+            return;
+        };
+        let mid_hex = hex_encode(&mid);
+        if let Some(fullname) = lock(&self.mdns_services).remove(&mid_hex) {
+            mdns_unregister(&daemon, &fullname);
+        }
     }
 
     /// 分享文件并返回一次性密钥
     pub fn share_file(self: &Arc<Self>, path: PathBuf) -> Result<String, String> {
+        self.share_path(path, false)
+    }
+
+    /// 分享一组文件或文件夹：单个文件直传，多个文件或文件夹先打包成 zip
+    pub fn share_paths(self: &Arc<Self>, paths: Vec<PathBuf>) -> Result<String, String> {
+        if paths.len() == 1
+            && paths[0].is_file()
+        {
+            return self.share_path(paths[0].clone(), false);
+        }
+        let base = paths
+            .first()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "打包".to_string());
+        let zip = zip_paths(&paths, &base)?;
+        self.share_path(zip, true)
+    }
+
+    fn share_path(self: &Arc<Self>, path: PathBuf, temp: bool) -> Result<String, String> {
         let mut rec = ShareRecord::new(path)?;
+        rec.temp = temp;
         // 只有发送方才需要监听 TCP，接收方不会占用 8765
         self.ensure_http()?;
         let mut shares = lock(&self.shares);
@@ -356,7 +436,10 @@ impl Collab {
             rec.rekey()?;
         }
         let key = rec.key.clone();
+        let mid = rec.match_id;
         shares.insert(key.clone(), rec);
+        drop(shares);
+        self.register_mdns(mid);
         Ok(key)
     }
 
@@ -370,6 +453,7 @@ impl Collab {
         if old.state == ShareState::InProgress {
             return Err("正在传输中，请稍后再试".to_string());
         }
+        let old_mid = old.match_id;
         // 空闲时端口可能已自动关闭，重新生成密钥后对方仍要能连上，故先确保监听
         self.ensure_http()?;
         let mut rec = ShareRecord {
@@ -384,6 +468,7 @@ impl Collab {
             key: String::new(),
             state: ShareState::Pending,
             created: Instant::now(),
+            temp: old.temp,
         };
         rec.rekey()?;
         for _ in 0..5 {
@@ -395,8 +480,12 @@ impl Collab {
             rec.rekey()?;
         }
         let new_key = rec.key.clone();
+        let new_mid = rec.match_id;
         shares.remove(key);
         shares.insert(new_key.clone(), rec);
+        drop(shares);
+        self.unregister_mdns(old_mid);
+        self.register_mdns(new_mid);
         Ok(new_key)
     }
 
@@ -448,7 +537,7 @@ impl Collab {
         let udp = lock(&self.udp)
             .clone()
             .ok_or_else(|| "发现服务未启动".to_string())?;
-        let targets: Vec<SocketAddr> = match direct {
+        let mut targets: Vec<SocketAddr> = match direct {
             Some(ip) => vec![SocketAddr::new(ip, self.discovery_port)],
             None => broadcast_targets()
                 .into_iter()
@@ -461,11 +550,24 @@ impl Collab {
         lock(&self.waiting).insert(mid_hex.clone());
         let deadline = Instant::now() + timeout;
         let mut next_send = Instant::now();
+        let mut next_mdns = Instant::now();
         loop {
             if cancel.load(Ordering::Relaxed) {
                 lock(&self.resolved).remove(&mid_hex);
                 lock(&self.waiting).remove(&mid_hex);
                 return Err("已取消".to_string());
+            }
+            // mDNS 补充发现：广播可能被防火墙/AP 丢弃，组播（mDNS）通常能穿透
+            if direct.is_none() && Instant::now() >= next_mdns {
+                if let Some(daemon) = lock(&self.mdns).clone() {
+                    if let Some(ip) = mdns_find(&daemon, &mid_hex, Duration::from_millis(300)) {
+                        let target = SocketAddr::new(IpAddr::V4(ip), self.discovery_port);
+                        if !targets.contains(&target) {
+                            targets.push(target);
+                        }
+                    }
+                }
+                next_mdns = Instant::now() + Duration::from_millis(1500);
             }
             if Instant::now() >= next_send {
                 for target in &targets {
@@ -826,7 +928,15 @@ fn spawn_acceptor(listener: TcpListener, me: Arc<Collab>) -> JoinHandle<()> {
 }
 
 fn prune(shares: &mut HashMap<String, ShareRecord>) {
+    let expired_temp: Vec<PathBuf> = shares
+        .values()
+        .filter(|r| r.expired() && r.temp)
+        .map(|r| r.path.clone())
+        .collect();
     shares.retain(|_, r| !r.expired());
+    for path in expired_temp {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// URL 中的主机部分：IPv6 地址必须用方括号包起来
