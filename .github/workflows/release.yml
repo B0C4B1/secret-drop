@@ -58,8 +58,8 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -67,6 +67,39 @@ jobs:
           cp "target/${{ matrix.target }}/release/secret-drop" dist/
           cp README.md dist/
           tar -C dist -czf "${{ matrix.archive }}" .
+
+      # macOS 必须打成 .app 包，Dock 与访达里才会显示自定义图标
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          APP=dist/SecretDrop.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/secret-drop" "$APP/Contents/MacOS/secret-drop"
+          chmod +x "$APP/Contents/MacOS/secret-drop"
+          cp assets/icon.icns "$APP/Contents/Resources/SecretDrop.icns"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>SecretDrop</string>
+            <key>CFBundleDisplayName</key><string>密钥快传</string>
+            <key>CFBundleIdentifier</key><string>dev.secretdrop.app</string>
+            <key>CFBundleExecutable</key><string>secret-drop</string>
+            <key>CFBundleIconFile</key><string>SecretDrop</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          cp README.md dist/
+          tar -C dist -czf "${{ matrix.archive }}" SecretDrop.app README.md
 
       - name: Package (Windows)
         if: runner.os == 'Windows'

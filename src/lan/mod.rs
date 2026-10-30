@@ -286,10 +286,10 @@ impl Collab {
         *lock(&self.discovery_thread) = Some(handle);
 
         // 初始化 mDNS（失败静默降级，UDP 广播仍可用）
-        if lock(&self.mdns).is_none() {
-            if let Ok(daemon) = mdns_new_daemon() {
-                *lock(&self.mdns) = Some(daemon);
-            }
+        if lock(&self.mdns).is_none()
+            && let Ok(daemon) = mdns_new_daemon()
+        {
+            *lock(&self.mdns) = Some(daemon);
         }
         Ok(())
     }
@@ -399,16 +399,9 @@ impl Collab {
         }
     }
 
-    /// 分享文件并返回一次性密钥
-    pub fn share_file(self: &Arc<Self>, path: PathBuf) -> Result<String, String> {
-        self.share_path(path, false)
-    }
-
     /// 分享一组文件或文件夹：单个文件直传，多个文件或文件夹先打包成 zip
     pub fn share_paths(self: &Arc<Self>, paths: Vec<PathBuf>) -> Result<String, String> {
-        if paths.len() == 1
-            && paths[0].is_file()
-        {
+        if paths.len() == 1 && paths[0].is_file() {
             return self.share_path(paths[0].clone(), false);
         }
         let base = paths
@@ -558,13 +551,14 @@ impl Collab {
                 return Err("已取消".to_string());
             }
             // mDNS 补充发现：广播可能被防火墙/AP 丢弃，组播（mDNS）通常能穿透
-            if direct.is_none() && Instant::now() >= next_mdns {
-                if let Some(daemon) = lock(&self.mdns).clone() {
-                    if let Some(ip) = mdns_find(&daemon, &mid_hex, Duration::from_millis(300)) {
-                        let target = SocketAddr::new(IpAddr::V4(ip), self.discovery_port);
-                        if !targets.contains(&target) {
-                            targets.push(target);
-                        }
+            if direct.is_none()
+                && Instant::now() >= next_mdns
+                && let Some(daemon) = lock(&self.mdns).clone()
+            {
+                if let Some(ip) = mdns_find(&daemon, &mid_hex, Duration::from_millis(300)) {
+                    let target = SocketAddr::new(IpAddr::V4(ip), self.discovery_port);
+                    if !targets.contains(&target) {
+                        targets.push(target);
                     }
                 }
                 next_mdns = Instant::now() + Duration::from_millis(1500);
@@ -1097,7 +1091,7 @@ mod tests {
         let collab = Arc::new(Collab::new(port, DEFAULT_DISCOVERY_PORT));
         collab.running.store(true, Ordering::Relaxed);
         collab.ensure_http().unwrap();
-        let key = collab.share_file(src).unwrap();
+        let key = collab.share_paths(vec![src]).unwrap();
         let master = derive_key(&key, &salt_for(&key)).unwrap();
         let token = token_for(&master);
         let path = format!("/get/{token}");

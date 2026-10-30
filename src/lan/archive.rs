@@ -20,10 +20,7 @@ pub(super) fn zip_paths(paths: &[PathBuf], base_name: &str) -> Result<PathBuf, S
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let tmp = std::env::temp_dir().join(format!(
-        "{base_name}-{stamp}-{}.zip",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("{base_name}-{stamp}-{}.zip", std::process::id()));
 
     let file = File::create(&tmp).map_err(|e| format!("无法创建临时文件：{e}"))?;
     let mut zip = ZipWriter::new(file);

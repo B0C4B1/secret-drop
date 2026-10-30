@@ -44,7 +44,11 @@ pub(super) fn unregister(mdns: &ServiceDaemon, fullname: &str) {
 
 /// 在超时时间内浏览 mDNS，寻找 match_id 对应的发送方 IPv4。
 /// 找到后返回其地址，由调用方继续走 UDP 单播校验流程。
-pub(super) fn find(mdns: &ServiceDaemon, match_id_hex: &str, timeout: Duration) -> Option<Ipv4Addr> {
+pub(super) fn find(
+    mdns: &ServiceDaemon,
+    match_id_hex: &str,
+    timeout: Duration,
+) -> Option<Ipv4Addr> {
     let receiver = mdns.browse(SERVICE_TYPE).ok()?;
     let deadline = Instant::now() + timeout;
     let prefix = format!("{match_id_hex}.");
@@ -52,10 +56,10 @@ pub(super) fn find(mdns: &ServiceDaemon, match_id_hex: &str, timeout: Duration) 
         let remaining = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(remaining) {
             Ok(ServiceEvent::ServiceResolved(info)) => {
-                if info.get_fullname().starts_with(&prefix) {
-                    if let Some(ip) = ipv4(&info.get_addresses()) {
-                        return Some(ip);
-                    }
+                if info.get_fullname().starts_with(&prefix)
+                    && let Some(ip) = ipv4(info.get_addresses())
+                {
+                    return Some(ip);
                 }
             }
             Ok(_) => {}
