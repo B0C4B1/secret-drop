@@ -74,6 +74,24 @@
 - 跨网段、VPN、多网卡环境广播可能失效，此时使用手动直连（填 IP）；
 - IPv6 仅支持**手动直连**：`if-addrs` 不提供接口索引（scope_id），链路本地 `fe80::` 地址无法自动发现。
 
+## 下载现成程序
+
+不需要本地装 Rust：推送 `v*` 标签（如 `git tag v0.1.0 && git push origin v0.1.0`）会触发
+[Release 工作流](https://github.com/B0C4B1/secret-drop/actions/workflows/release.yml)，
+自动构建四个平台的压缩包并挂到 [Releases](https://github.com/B0C4B1/secret-drop/releases) 页面。
+
+| 平台 | 文件 |
+| --- | --- |
+| macOS（Apple 芯片） | `secret-drop-macos-arm64.tar.gz` |
+| macOS（Intel） | `secret-drop-macos-x86_64.tar.gz` |
+| Windows（x64） | `secret-drop-windows-x86_64.zip` |
+| Linux（x64） | `secret-drop-linux-x86_64.tar.gz` |
+
+也可以在 Actions 页面手动触发该工作流，产物在本次运行的 **Artifacts** 里（需登录 GitHub；Artifacts 有保留期限，Releases 长期有效）。
+
+- macOS 版本未签名，首次打开被拦下时执行 `xattr -d com.apple.quarantine ./secret-drop`，或在 Finder 里右键 →「打开」；
+- Linux 版本仍是动态链接，依赖系统的 GTK3 / X11 / Wayland 库（常见桌面环境已自带），缺失时按下方「构建」一节的依赖名安装。
+
 ## 构建
 
 需要 Rust 1.88 及以上（edition 2024）。
